@@ -10,13 +10,14 @@ from setuptools import setup, Extension
 #     include_dirs[1], "external/nsync/public"))
 
 compile_flags = tf.sysconfig.get_compile_flags()
-compile_flags += ["-std=c++11", "-stdlib=libc++", "-O2", "-undefined dynamic_lookup"]
+#compile_flags += ["-std=c++11", "-stdlib=libc++", "-O2", "-undefined dynamic_lookup"]
+compile_flags += ["-std=c++11", "-stdlib=libc++", "-O2"]
 link_flags = tf.sysconfig.get_link_flags()
 
 extensions = [
     Extension(
         "maelstrom.kepler.kepler_op",
-        sources=["maelstrom/kepler/kepler_op.cc"],
+        sources=["maelstrom/kepler/kepler_op.cc"],ß
         language="c++",
         extra_compile_args=compile_flags,
         extra_link_args=link_flags,
@@ -37,7 +38,7 @@ setup(
     license="MIT",
     packages=["maelstrom", "maelstrom.kepler", "maelstrom.interp"],
     url = 'https://github.com/SimonJMurphy/maelstrom',
-    install_requires=['numpy>=1.10','astropy>=1.0','tensorflow'],
+    install_requires=['numpy>=1.10','astropy>=1.0','tensorflow','hemcee'],
     ext_modules=extensions,
     zip_safe=True,
 )
