@@ -3,4 +3,4 @@
 
 from __future__ import absolute_import
 
-from .maelstrom import Maelstrom
+from .maelstrom import Maelstrom, RadialVelocity
