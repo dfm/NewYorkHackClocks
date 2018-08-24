@@ -9,7 +9,7 @@ import tensorflow as tf
 from astropy.stats import LombScargle
 
 
-def estimate_frequencies(x, y, max_peaks=6, oversample=4.0):
+def estimate_frequencies(x, y, max_peaks=9, oversample=4.0):
     tmax = x.max()
     tmin = x.min()
     dt = np.median(np.diff(x))
