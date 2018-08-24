@@ -2,44 +2,62 @@
 
 from __future__ import division, print_function
 
-__all__ = []
+__all__ = ['Maelstrom', 'RadialVelocity']
+
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import array_ops
+import hemcee
+from hemcee.sampler import TFModel
 
 from .kepler import kepler
-
+from .estimator import estimate_frequencies
 
 class Maelstrom(object):
     """The real deal
 
     Args:
-        time: The array of timestamps.
-        mag: The magnitudes measured at ``time``.
-        nu: An array of frequencies (in units of ...).
-        log_sigma2 (Optional): The log variance of the measurement noise.
-        with_eccen (Optional): Should eccentricity be included?
-            (default: ``True``)
+        time (array-like): 
+        mag (array-like):
+        nu (optional): 
+        log_sigma2:
+        session:
+        max_peaks:
+        **kwargs:
+        """
 
-    """
     T = tf.float64
+    C = 299792.458 # Speed of light km/s
 
-    def __init__(self, time, mag, nu, log_sigma2=None, **kwargs):
+    def __init__(self, time, mag, nu=None, rvs=None, log_sigma2=None, 
+                session=None, max_peaks=9, **kwargs):
+
         self.time_data = np.atleast_1d(time)
         self.mag_data = np.atleast_1d(mag)
+
+        self.rvs = rvs or []
+
+        # Estimate frequencies if none are supplied
+        if nu is None:
+            nu = estimate_frequencies(time, mag, max_peaks=max_peaks)
         self.nu_data = np.atleast_1d(nu)
 
+        # Placeholder tensors for time and mag data
         self.time = tf.constant(self.time_data, dtype=self.T)
         self.mag = tf.constant(self.mag_data, dtype=self.T)
 
-        self._session = None
+        self._session = session
 
         # Parameters
         if log_sigma2 is None:
             log_sigma2 = 0.0
         self.log_sigma2 = tf.Variable(log_sigma2, dtype=self.T,
                                       name="log_sigma2")
-        self.nu = tf.Variable(self.nu_data, dtype=self.T, name="nu")
+        self.nu = tf.Variable(self.nu_data, dtype=self.T, name="frequencies")
 
         self.setup_orbit_model(**kwargs)
 
@@ -53,14 +71,116 @@ class Maelstrom(object):
         DTy = tf.matmul(D, self.mag[:, None], transpose_a=True)
         W_hat = tf.linalg.solve(DTD, DTy)
 
-        # Finally, the model and the chi^2 objective:
-        self.model = tf.squeeze(tf.matmul(D, W_hat))
-        self.chi2 = tf.reduce_sum(tf.square(self.mag - self.model))
+        # Model and the chi^2 objective:
+        self.model_tensor = tf.squeeze(tf.matmul(D, W_hat))
+        self.chi2 = tf.reduce_sum(tf.square(self.mag - self.model_tensor))
         self.chi2 *= tf.exp(-self.log_sigma2)
         self.chi2 += len(self.time_data) * self.log_sigma2
 
+        # Add radial velocity to objective
+        for rv in self.rvs:
+            self.chi2 += tf.reduce_sum(rv.chi)
+        
         # Initialize all the variables
         self.run(tf.global_variables_initializer())
+
+        # Minimal working feed dict for lightcurve
+        self._feed_dict = {
+            self.time: self.time_data,
+            self.mag: self.mag_data
+        }
+
+        # Update feed dict with RV data
+        for rv in self.rvs:
+            self._feed_dict.update({
+                rv.time: rv.time_data,
+                rv.vel: rv.vel_data,
+                rv.err: rv.err_data
+            })
+
+        # Wrap tensorflow in hemcee model
+        self._tf_model = TFModel(self.ln_prob, self.params, 
+                        self.feed_dict, session=self._session)
+
+        self._step = hemcee.step_size.VariableStepSize()
+
+        self._sampler = hemcee.NoUTurnSampler(self.tf_model.value, 
+                            self.tf_model.gradient, step_size=self._step)
+        
+
+    @staticmethod
+    def from_mast(target, **kwargs):
+        """Instantiates a Maelstrom object from target ID by downloading
+        photometry from MAST
+        """
+        try:
+            from lightkurve import KeplerLightCurveFile
+        except ImportError:
+            raise ImportError('Lightkurve package is required for MAST')
+        
+        """lc = KeplerLightCurveFile.from_archive(target, quarter=0)
+        lc = lc.PDCSAP_FLUX.normalize()
+        for q in range(1, 17):
+            new_lc = KeplerLightCurveFile.from_archive(target, quarter=q)
+            new_lc = new_lc.PDCSAP_FLUX.normalize()
+            lc = lc.append(new_lc)
+        lc = lc.remove_nans()"""
+
+        lcs = KeplerLightCurveFile.from_archive(target, quarter='all', 
+                                                cadence='long')
+        lc = lcs[0].PDCSAP_FLUX.remove_nans()
+        # Yes, this is absolutely cheating but I need the mags, not flux
+        lc.flux = -2.5 * np.log10(lc.flux)
+        lc.flux = lc.flux - np.average(lc.flux)
+
+        for i in lcs[1:]:
+            i = i.PDCSAP_FLUX.remove_nans()
+            i.flux = -2.5 * np.log10(i.flux)
+            i.flux = i.flux - np.average(i.flux)
+            lc = lc.append(i)
+            
+        return Maelstrom(lc.time, lc.flux, **kwargs)
+
+    @property
+    def sampler(self):
+        self._sampler = hemcee.NoUTurnSampler(self.tf_model.value, 
+                            self.tf_model.gradient, step_size=self._step)
+        return self._sampler
+
+    @property
+    def tf_model(self):
+        #self._packed_params = self._pack(self.params)
+        self._tf_model = TFModel(self.ln_prob, self.params, 
+                        self.feed_dict, session=self._session)
+        self._tf_model.setup()
+        return self._tf_model
+
+    @property
+    def ln_prob(self):
+        return - 0.5 * self.chi2 # + self.ln_prior
+
+    @property
+    def feed_dict(self):
+        return self._feed_dict
+
+    @feed_dict.setter
+    def feed_dict(self, feed_dict):
+        self._feed_dict = feed_dict
+
+    @property
+    def params(self):
+        return self._params
+
+    @params.setter
+    def params(self, params):
+        self._params = params
+        # Reorganize ln prior here
+
+    @property
+    def session(self):
+        if self._session is None:
+            self._session = tf.Session()
+        return self._session
 
     def setup_orbit_model(self, with_eccen=True):
         self.with_eccen = with_eccen
@@ -85,6 +205,43 @@ class Maelstrom(object):
         if self.with_eccen:
             self.params += [self.eccen_param, self.varpi]
 
+        # If radial velocity data is supplied, generate gammav, logsigma2
+        if self.rvs:
+            self.gamma_v = tf.Variable(np.mean(self.rvs[0].vel_data) / self.C, 
+                                    dtype=self.T, name="gamma_v")
+            self.log_rv_sigma2 = tf.Variable(0.0, dtype=self.T, 
+                                            name="log_rv_sigma2")
+            self.params += [self.gamma_v, self.log_sigma2]
+
+        self._lighttime_per_mode = tf.gather(self.lighttime,
+                                             self.lighttime_inds)
+
+        # Incorporating RV data
+        for rv in self.rvs:
+            # Keplers equations
+            rv.mean_anom = 2.0 * np.pi * (rv.time - self.tref) / self.period
+            rv.ecc_anom = kepler(rv.mean_anom, self.eccen)
+            rv.true_anom = (2.0 * tf.atan2(tf.sqrt(1.0+self.eccen) *
+                            tf.tan(0.5*rv.ecc_anom), tf.sqrt(1.0-self.eccen)
+                            + tf.zeros_like(rv.time)))
+            
+            # Here we define how the RV will be calculated
+            # This gives (J,N)
+            rv.vrad = (self._lighttime_per_mode[None,:] * (-2.0 * np.pi * (1 / self.period) * 
+                (1/tf.sqrt(1.0 - tf.square(self.eccen))) * 
+                (tf.cos(rv.true_anom + self.varpi) + 
+                self.eccen*tf.cos(self.varpi)))[:,None]
+                )
+            rv.vrad *= self.C
+            rv.vrad += self.gamma_v
+
+            # Account for uncertainty in RV
+            rv.sig2 = tf.square(rv.err) + tf.exp(-self.log_rv_sigma2)
+
+            # Add objective to RV object
+            rv.chi = (tf.square(rv.vel[:,None] - rv.vrad) / rv.sig2[:,None]
+                   + tf.log(rv.sig2[:,None]))
+
         # Set up the model
         self.mean_anom = 2.0*np.pi*(self.time-self.tref)/self.period
         if self.with_eccen:
@@ -99,21 +256,14 @@ class Maelstrom(object):
             self.psi = -tf.sin(self.mean_anom)
 
         # Build the design matrix
-        self._lighttime_per_mode = tf.gather(self.lighttime,
-                                             self.lighttime_inds)
         self.tau = self._lighttime_per_mode[None, :] * self.psi[:, None]
 
     def run(self, *args, **kwargs):
-        return self.get_session().run(*args, **kwargs)
+        return self.session.run(*args, **kwargs)
 
     def __del__(self):
         if self._session is not None:
             self._session.close()
-
-    def get_session(self, *args, **kwargs):
-        if self._session is None:
-            self._session = tf.Session(*args, **kwargs)
-        return self._session
 
     def init_from_orbit(self, period, lighttime, tref=0.0, eccen=1e-5,
                         varpi=0.0):
@@ -139,37 +289,34 @@ class Maelstrom(object):
             ops.append(tf.assign(self.varpi, varpi))
         self.run(ops)
 
-    def get_fit_parameters(self):
-        """Get the list of parameters that are being fit"""
-        return self.params
-
-    def set_fit_parameters(self, params):
-        """Set the list of parameters that should be fit
-
-        Args:
-            params: A list of TensorFlow variables that should be fit.
-
-        """
-        self.params = params
-
     def optimize(self, params=None, **kwargs):
+        """Optimizes the TensorFlow model using Scipy interface
+ 
+        Args:
+            params (optional) : List of TensorFlow variables
+            **kwargs (optional) : Args to pass to opt.minimize()
+        """
         if params is None:
             params = self.params
-        kwargs["method"] = kwargs.get("method", "L-BFGS-B")
         opt = tf.contrib.opt.ScipyOptimizerInterface(self.chi2, params,
                                                      **kwargs)
-        return opt.minimize(self.get_session())
+        return opt.minimize(self.session, feed_dict=self.feed_dict) 
 
     def get_lighttime_estimates(self):
+        """Estimates lighttime values """
         ivar = -tf.diag_part(tf.hessians(-0.5*self.chi2,
                                          self._lighttime_per_mode)[0])
         return self.run([self._lighttime_per_mode, np.abs(ivar)])
 
     def pin_lighttime_values(self):
+        """Pins estimated lighttime values to positive or negative. """
         lt, lt_ivar = self.get_lighttime_estimates()
         chi = lt * np.sqrt(lt_ivar)
-        mask = chi < -1.0
-        if np.any(mask):
+        mask_lower = chi < -1.0
+        # Upper mask for case where lighttime is always negative.
+        # Otherwise there's a div 0 in lt
+        mask_upper = chi > 1.0
+        if np.any(mask_lower) and np.any(mask_upper):
             m1 = lt >= 0
             m2 = ~m1
             lt = np.array([
@@ -184,8 +331,172 @@ class Maelstrom(object):
         self.run([
             tf.assign(self.lighttime_inds, inds),
             tf.assign(self.lighttime[:len(lt)], lt),
+            # Shape of lighttime is always preserved
             tf.assign(self.lighttime[len(lt):],
                       np.zeros(len(lt_ivar)-len(lt))),
         ])
-
         return inds, lt
+            
+    def run_mcmc(self, samples=1000):
+        """Runs model using Hemcee, storing samples and lnprob in chain attrib
+ 
+        Args:
+            samples (optional, default 1000) 
+            parallel (bool): Whether to run multiple chains in parallel
+        """
+        def sampler_wrap(sample):
+            np.random.seed() # or tf random seed?
+            return self.sampler.run_mcmc(
+                    [self.run(param) for param in self.params], 
+                    sample
+                    )
+
+        # Apparently Pool can not pickle class methods in python ...
+        parallel=False
+        if parallel:
+            num_cpu = cpu_count()
+            pool = Pool(processes=num_cpu)
+
+            sample_split = [int(np.ceil(samples/num_cpu))]*num_cpu
+            pool_results = pool.map(sampler_wrap, sample_split)
+
+            self.chain = [res for res in pool_results]
+        else:
+            self.chain = sampler_wrap(samples)
+
+    def run_warmup(self, samples=1000):
+        """Runs warmup of model using Hemcee, replaces tensor values
+ 
+        Args:
+            samples (optional, default 1000)
+            **kwargs : args to pass to Hemcee
+        """
+        
+        results = self.sampler.run_warmup(self.tf_model.current_vector(),
+                                    samples,
+                                    tune_metric=True)
+
+        # Set optimization params to their new values
+        self._update_placeholders = [
+            array_ops.placeholder(param.dtype) for param in self.params
+        ]
+        self._param_updates = [
+                param.assign(array_ops.reshape(placeholder, self._get_shape_tuple(param)))
+                for param, placeholder in zip(self.params, self._update_placeholders)
+        ]
+        self.run(
+            self._param_updates,
+            feed_dict=dict(zip(self._update_placeholders, results[0]))
+            )
+
+    def get_bounded_for_value(self, value, min_value, max_value):
+        if np.any(value <= min_value) or np.any(value >= max_value):
+            raise ValueError("value must be in the range (min_value,\
+             max_value)")
+        return np.log(value - min_value) - np.log(max_value - value)
+
+    def get_value_for_bounded(self, param, min_value, max_value):
+        return min_value + (max_value - min_value) / (1.0 + np.exp(-param))
+
+    def get_bounded_variable(self, name, value, min_value, max_value, 
+                            dtype=tf.float64):
+        param = tf.Variable(self.get_bounded_for_value(value, min_value, 
+                            max_value), dtype=dtype, name=name + "_param")
+        var = min_value + (max_value - min_value) / (1.0 + tf.exp(-param))
+        log_jacobian = (tf.log(var - min_value) + tf.log(max_value - var) -
+                        np.log(max_value - min_value))
+        return param, var, tf.reduce_sum(log_jacobian), (min_value, max_value)
+
+    def _pack(self, tensors):
+        """Pack a list of `Tensor`s into a single rank-1 `Tensor`."""
+        if not tensors:
+            return None
+        elif len(tensors) == 1:
+            return array_ops.reshape(tensors[0], [-1])
+        else:
+            flattened = [array_ops.reshape(tensor, [-1]) for tensor in tensors]
+            return array_ops.concat(flattened, 0)
+
+    def _get_shape_tuple(self, tensor):
+        """ Exactly what it says on the tin. """
+        return tuple(dim.value for dim in tensor.get_shape())
+
+class RadialVelocity(object):
+    """Radial velocity class for handling RV data
+
+    Args:
+        time: The array of timestamps.
+        vel: The velocities measured at ``time``.
+        err (Optional): An array of errors of vel (in units of vel).
+            (default: ``None``)
+        meta (Optional): Extra information about the RV data
+            (default: ``{}``)
+    """
+    T = tf.float64
+
+    def __init__(self, time, vel, err=None, meta={}):
+        self.time_data = time
+        self.vel_data = vel
+        if err is not None:    
+            self.err_data = err
+        self.meta = meta
+
+        self.time = tf.constant(self.time_data, dtype=self.T)
+        self.vel = tf.constant(self.vel_data, dtype=self.T)
+        self.err = tf.constant(self.err_data, dtype=self.T)
+
+    def plot(self, ax=None, xlabel='Time (days)',
+            ylabel='Radial velocity (km/s)', title=None, **kwargs):
+        if ax is None:
+            fig, ax = plt.subplots(1)
+        if np.any(~np.isfinite(self.err_data)):
+            ax.scatter(self.time_data, self.vel_data, **kwargs)
+        else:
+            ax.errorbar(self.time_data, self.vel_data, self.err_data, 
+                        fmt='o', **kwargs)
+        if title is not None:
+            ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        return ax
+
+    def fold(self, period=0.):
+        folded_time = self.time_data % period / period
+        return RadialVelocity(folded_time, self.vel_data, self.err_data, 
+                            self.meta)
+
+# Hmmmmmmmm
+"""class Parameter(object):
+    def __init__(self, name, value, dtype=tf.float64):
+        self.name = name
+        self.value = value
+        self.log_prior = 0.
+
+class BoundParameter(Parameter):
+    def __init__(self, name, value, min_value, max_value, dtype=tf.float64):
+        super().__init__(name, value)
+        
+        self.min_value = min_value
+        self.max_value = max_value
+        
+        # Bound
+        self.param = tf.Variable(self.get_bounded_for_value(self.value, 
+                                                            self.min_value, 
+                                                            self.max_value), 
+                                dtype=dtype, name=name + "_param")
+        self.var = self.min_value + (self.max_value - self.min_value) / \
+                    (1.0 + tf.exp(-self.param))
+        
+        self.log_jacobian = (tf.log(self.var - self.min_value) + 
+                            tf.log(self.max_value - self.var) - 
+                            np.log(self.max_value - self.min_value))
+        self.log_prior = tf.reduce_sum(self.log_jacobian)
+
+    def get_bounded_for_value(self, value, min_val, max_val):
+        if np.any(value <= min_val) or np.any(value >= max_val):
+            raise ValueError("Value must be within the given bounds")
+        return np.log(value-min_val)-np.log(max_val-value)
+    
+    def get_value_for_bounded(self,param):
+        return self.min_value + (self.max_value - self.min_value) / \
+                (1.0 + np.exp(-param))"""
