@@ -35,29 +35,6 @@ class InterpMaelstrom(Maelstrom):
                                                  len(self.nu_data)),
                                                 dtype=self.T)
 
-    @staticmethod
-    def from_mast(target, **kwargs):
-        """Instantiates a Maelstrom object from target ID by downloading
-        photometry from MAST
-        """
-        try:
-            from lightkurve import KeplerLightCurveFile
-        except ImportError:
-            raise ImportError('Lightkurve package is required for MAST')
-        
-        lcs = KeplerLightCurveFile.from_archive(target, quarter='all', 
-                                                cadence='long')
-        lc = lcs[0].PDCSAP_FLUX.remove_nans()
-        lc.flux = -2.5 * np.log10(lc.flux)
-        lc.flux = lc.flux - np.average(lc.flux)
-        for i in lcs[1:]:
-            i = i.PDCSAP_FLUX.remove_nans()
-            i.flux = -2.5 * np.log10(i.flux)
-            i.flux = i.flux - np.average(i.flux)
-            lc = lc.append(i)
-
-        return InterpMaelstrom(lc.time, lc.flux, **kwargs)
-
     def to_maelstrom(self):
         return Maelstrom(self.time_data, self.mag_data, self.nu_data)
         

@@ -13,7 +13,7 @@ compile_flags = tf.sysconfig.get_compile_flags()
 compile_flags += ["-std=c++11", 
                 #"-stdlib=libc++", # This one won't work on clang Linux?
                 "-O2",
-                #"-undefined dynamic_lookup"
+                "-undefined dynamic_lookup"
                 ]
 link_flags = tf.sysconfig.get_link_flags()
 

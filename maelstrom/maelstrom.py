@@ -35,7 +35,6 @@ class Maelstrom(object):
 
     def __init__(self, time, mag, nu=None, rvs=None, log_sigma2=None, 
                 session=None, max_peaks=9, **kwargs):
-
         self.time_data = np.atleast_1d(time)
         self.mag_data = np.atleast_1d(mag)
 
@@ -106,40 +105,6 @@ class Maelstrom(object):
 
         self._sampler = hemcee.NoUTurnSampler(self.tf_model.value, 
                             self.tf_model.gradient, step_size=self._step)
-        
-
-    @staticmethod
-    def from_mast(target, **kwargs):
-        """Instantiates a Maelstrom object from target ID by downloading
-        photometry from MAST
-        """
-        try:
-            from lightkurve import KeplerLightCurveFile
-        except ImportError:
-            raise ImportError('Lightkurve package is required for MAST')
-        
-        """lc = KeplerLightCurveFile.from_archive(target, quarter=0)
-        lc = lc.PDCSAP_FLUX.normalize()
-        for q in range(1, 17):
-            new_lc = KeplerLightCurveFile.from_archive(target, quarter=q)
-            new_lc = new_lc.PDCSAP_FLUX.normalize()
-            lc = lc.append(new_lc)
-        lc = lc.remove_nans()"""
-
-        lcs = KeplerLightCurveFile.from_archive(target, quarter='all', 
-                                                cadence='long')
-        lc = lcs[0].PDCSAP_FLUX.remove_nans()
-        # Yes, this is absolutely cheating but I need the mags, not flux
-        lc.flux = -2.5 * np.log10(lc.flux)
-        lc.flux = lc.flux - np.average(lc.flux)
-
-        for i in lcs[1:]:
-            i = i.PDCSAP_FLUX.remove_nans()
-            i.flux = -2.5 * np.log10(i.flux)
-            i.flux = i.flux - np.average(i.flux)
-            lc = lc.append(i)
-            
-        return Maelstrom(lc.time, lc.flux, **kwargs)
 
     @property
     def sampler(self):
@@ -227,7 +192,7 @@ class Maelstrom(object):
             
             # Here we define how the RV will be calculated
             # This gives (J,N)
-            rv.vrad = (self._lighttime_per_mode[None,:] * (-2.0 * np.pi * (1 / self.period) * 
+            rv.vrad = ((self._lighttime_per_mode / 86400)[None,:] * (-2.0 * np.pi * (1 / self.period) * 
                 (1/tf.sqrt(1.0 - tf.square(self.eccen))) * 
                 (tf.cos(rv.true_anom + self.varpi) + 
                 self.eccen*tf.cos(self.varpi)))[:,None]
@@ -256,7 +221,7 @@ class Maelstrom(object):
             self.psi = -tf.sin(self.mean_anom)
 
         # Build the design matrix
-        self.tau = self._lighttime_per_mode[None, :] * self.psi[:, None]
+        self.tau = (self._lighttime_per_mode / 86400)[None, :] * self.psi[:, None]
 
     def run(self, *args, **kwargs):
         return self.session.run(*args, **kwargs)
@@ -331,12 +296,11 @@ class Maelstrom(object):
         self.run([
             tf.assign(self.lighttime_inds, inds),
             tf.assign(self.lighttime[:len(lt)], lt),
-            # Shape of lighttime is always preserved
             tf.assign(self.lighttime[len(lt):],
                       np.zeros(len(lt_ivar)-len(lt))),
         ])
         return inds, lt
-            
+
     def run_mcmc(self, samples=1000):
         """Runs model using Hemcee, storing samples and lnprob in chain attrib
  
@@ -345,7 +309,7 @@ class Maelstrom(object):
             parallel (bool): Whether to run multiple chains in parallel
         """
         def sampler_wrap(sample):
-            np.random.seed() # or tf random seed?
+            np.random.seed()
             return self.sampler.run_mcmc(
                     [self.run(param) for param in self.params], 
                     sample
@@ -444,59 +408,3 @@ class RadialVelocity(object):
         self.time = tf.constant(self.time_data, dtype=self.T)
         self.vel = tf.constant(self.vel_data, dtype=self.T)
         self.err = tf.constant(self.err_data, dtype=self.T)
-
-    def plot(self, ax=None, xlabel='Time (days)',
-            ylabel='Radial velocity (km/s)', title=None, **kwargs):
-        if ax is None:
-            fig, ax = plt.subplots(1)
-        if np.any(~np.isfinite(self.err_data)):
-            ax.scatter(self.time_data, self.vel_data, **kwargs)
-        else:
-            ax.errorbar(self.time_data, self.vel_data, self.err_data, 
-                        fmt='o', **kwargs)
-        if title is not None:
-            ax.set_title(title)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        return ax
-
-    def fold(self, period=0.):
-        folded_time = self.time_data % period / period
-        return RadialVelocity(folded_time, self.vel_data, self.err_data, 
-                            self.meta)
-
-# Hmmmmmmmm
-"""class Parameter(object):
-    def __init__(self, name, value, dtype=tf.float64):
-        self.name = name
-        self.value = value
-        self.log_prior = 0.
-
-class BoundParameter(Parameter):
-    def __init__(self, name, value, min_value, max_value, dtype=tf.float64):
-        super().__init__(name, value)
-        
-        self.min_value = min_value
-        self.max_value = max_value
-        
-        # Bound
-        self.param = tf.Variable(self.get_bounded_for_value(self.value, 
-                                                            self.min_value, 
-                                                            self.max_value), 
-                                dtype=dtype, name=name + "_param")
-        self.var = self.min_value + (self.max_value - self.min_value) / \
-                    (1.0 + tf.exp(-self.param))
-        
-        self.log_jacobian = (tf.log(self.var - self.min_value) + 
-                            tf.log(self.max_value - self.var) - 
-                            np.log(self.max_value - self.min_value))
-        self.log_prior = tf.reduce_sum(self.log_jacobian)
-
-    def get_bounded_for_value(self, value, min_val, max_val):
-        if np.any(value <= min_val) or np.any(value >= max_val):
-            raise ValueError("Value must be within the given bounds")
-        return np.log(value-min_val)-np.log(max_val-value)
-    
-    def get_value_for_bounded(self,param):
-        return self.min_value + (self.max_value - self.min_value) / \
-                (1.0 + np.exp(-param))"""
