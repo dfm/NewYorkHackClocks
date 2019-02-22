@@ -13,40 +13,30 @@ from hemcee.sampler import TFModel
 from maelstrom.kepler import kepler
 
 # In[2]
-#kicid=8311110 # Weird? PB1/SB2
-kicid=6756386 # PB1/SB1
-rv = True
+kicid=5709664 # PB1/SB1
+rv = False
 Hemcee = True
 td=True
-#kicid = 9837267
 
-#kicid = 8311110  # SB1
-#kicid = 6862920  # PB2/SB2 high e
-#kicid = 10080943  #PB2/SB2 low e
-#kicid = 4471379 # SB0
-
-times, dmag = np.loadtxt(f"data/kic{kicid}_lc.txt",usecols=(0,1)).T
+times, dmag = np.loadtxt("kic5709664_appended-msMAP_Q99_llc.txt",usecols=(0,1)).T
 time_mid = (times[0] + times[-1]) / 2.
 times -= time_mid
 dmmags = dmag * 1000. 
-metadata = np.loadtxt(f"data/kic{kicid}_metadata.csv", delimiter=",", skiprows=1)
-nu_arr = metadata[::6]
+
+nu_arr = [19.44005582, 16.25960082, 22.55802495, 19.123847  , 27.87541656,
+       22.07540612]
 
 if rv:
     # Read in radial velocity data
-    rv_JD, rv_RV, rv_err = np.loadtxt(f"data/kic{kicid}_JDrv.txt",delimiter=",", usecols=(0,1,2)).T
+    rv_JD, rv_RV, rv_err = np.loadtxt('kic5709664b_JDrv.txt',delimiter=",", usecols=(0,1,2)).T
     rv_JD -= time_mid
 
-orbits = pd.read_csv(f"data/orbits.csv").rename(columns = lambda x: x.strip())
-#orbits = pd.read_csv(f"data/kic{kicid}_orbit.csv").rename(columns = lambda x: x.strip())
-
-orb_params = orbits[orbits.Name == f"kic{kicid}"].iloc[0]
-porb = orb_params.Porb
-a1 = orb_params["a1sini/c"] 
-tp = orb_params["t_p"] - time_mid 
-e = orb_params["e"]
-varpi = orb_params["varpi"]
-a1d = a1/86400.0
+porb = 95.4
+a1 = 114.
+tp = -220
+e = 0.483
+varpi = 0.388
+a1d = a1#/86400.0
 
 
 # In[4]:
@@ -72,9 +62,8 @@ class BoundParam(object):
     
     def get_value_for_bounded(self,param):
         return self.min_value + (self.max_value - self.min_value) / (1.0 + np.exp(-param))
+    
 # In[5]: Setup tensorflow variables with bounds
-# FIT: PARAM
-# EQTNS:  VAR
 sess = tf.InteractiveSession()
 T = tf.float64
 
@@ -86,11 +75,8 @@ porb_tensor = BoundParam('Porb', porb, 1, 500)  # Orbital period
 varpi_tensor = BoundParam('Varpi', varpi, 0, 5)   # Angle of the ascending node
 tp_tensor = BoundParam('t_p', tp, -1000, 0) # Time of periastron
 e_tensor = BoundParam('e', e, 1e-10, 0.99) # Eccentricity
-log_sigma2_tensor = BoundParam('log_sigma2', 0., -5, 5) # Known value
-a1d_tensor = BoundParam('a_1d', a1d, -0.1, 0.1) # Projected semimajor axis
-
-#varpi_tensor = tf.Variable(varpi, dtype=T)
-#tp_tensor = tf.Variable(tp, dtype=T)
+log_sigma2_tensor = BoundParam('log_sigma2', -1.14, -5, 5) # Known value
+a1d_tensor = BoundParam('a_1d', a1d, -300, 300.) # Projected semimajor axis
 
 if rv:
     # Tensors specific to SB1/2
@@ -99,12 +85,6 @@ if rv:
     # If gammav is specified as gammav/c then scipy fit will work fine
     gammav_tensor = BoundParam('gammav',np.mean(rv_RV),-100,100)
     log_rv_sigma2_tensor = BoundParam('logrv', 0., -0.1,0.1)
-    
-# In[]: Equations of time delay
-# These are some placeholders for the data:
-#gammav_tensor = tf.Variable(-9.504895133030655e-05, dtype=T)
-#log_sigma2_tensor = tf.Variable(0.22819914486921133, dtype=T)
-#log_rv_sigma2_tensor = tf.Variable(-2.198331376379592e-06, dtype=T)
 
 times_tensor = tf.placeholder(T, times.shape)
 dmmags_tensor = tf.placeholder(T, dmmags.shape)
@@ -117,7 +97,7 @@ if td:
     true_anom = 2.0 * tf.atan2(tf.sqrt(1.0+e_tensor.var)*tf.tan(0.5*ecc_anom),tf.sqrt(1.0-e_tensor.var) + tf.zeros_like(times_tensor))
     
     # Here we define how the time delay will be calculated:
-    tau_tensor = -a1d_tensor.var * (1.0 - tf.square(e_tensor.var)) * tf.sin(true_anom + varpi_tensor.var) / (1.0 + e_tensor.var*tf.cos(true_anom))
+    tau_tensor = -(a1d_tensor.var / 86400) * (1.0 - tf.square(e_tensor.var)) * tf.sin(true_anom + varpi_tensor.var) / (1.0 + e_tensor.var*tf.cos(true_anom))
     
     # And the design matrix:
     arg_tensor = 2.0 * np.pi * nu_tensor[None, :] * (times_tensor - tau_tensor)[:, None]
@@ -147,7 +127,7 @@ if rv:
     rv_true_anom = 2.0 * tf.atan2(tf.sqrt(1.0+e_tensor.var)*tf.tan(0.5*rv_ecc_anom), tf.sqrt(1.0-e_tensor.var) + tf.zeros_like(rv_time_tensor))
     
     # Here we define how the RV will be calculated:
-    vrad_tensor = -2.0 * np.pi * (a1d_tensor.var / porb_tensor.var) * (1/tf.sqrt(1.0 - tf.square(e_tensor.var))) * (tf.cos(rv_true_anom + varpi_tensor.var) + e_tensor.var*tf.cos(varpi_tensor.var))
+    vrad_tensor = -2.0 * np.pi * ((a1d_tensor.var /86400) / porb_tensor.var) * (1/tf.sqrt(1.0 - tf.square(e_tensor.var))) * (tf.cos(rv_true_anom + varpi_tensor.var) + e_tensor.var*tf.cos(varpi_tensor.var))
     vrad_tensor *= 299792.458  # c in km/s
     vrad_tensor += gammav_tensor.var
     
@@ -163,20 +143,18 @@ if rv:
 init = tf.global_variables_initializer()
 sess.run(init)
 
-# In[7]:hhhhhhffffj
+
 feed_dict = {
     times_tensor: times,
     dmmags_tensor: dmmags
 }
-# Not working simultaneously:
-# varpi & tp
 
 var = [
-    porb_tensor, # PORB OK
-    varpi_tensor, # BY ITSELF: OK, 1.05
-    tp_tensor, # BY ITSELF: OK, -320.20
+    porb_tensor,
+    varpi_tensor, 
+    tp_tensor,
     a1d_tensor,
-    e_tensor, # NOT OK
+    e_tensor, 
     log_sigma2_tensor,
 ]
 
@@ -223,14 +201,10 @@ if Hemcee:
             plot=False, update_interval=100, 
             tune=False
             )
-    #taus = np.array([hemcee.autocorr.integrated_time(coords_chain[:, i])[0] for i in range(len(coords))])
-    #print("Mean autocorrelation time: {0}".format(np.mean(taus)))
+    
     plt.plot([coord[0] for coord in coords_chain])
     plt.title('$P_{orb}$ trace')
     
-    # import pandas as pd
-    # df = pd.DataFrame(data=logprob_chain)
-    # df.to_csv('logprob_chain.csv')
     
     for i,tensor in enumerate(var):
         tensor.real = tensor.get_value_for_bounded(coords_chain[:,i])
