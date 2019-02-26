@@ -11,8 +11,8 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
-import hemcee
-from hemcee.sampler import TFModel
+# import hemcee
+# from hemcee.sampler import TFModel
 
 from .kepler import kepler
 from .estimator import estimate_frequencies
